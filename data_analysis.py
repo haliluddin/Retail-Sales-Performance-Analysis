@@ -264,3 +264,45 @@ def metric_row(name, value, definition):
 valid_sales_dates = orders_enriched["Order_Date"].dropna()
 first_order_date = valid_sales_dates.min() if not valid_sales_dates.empty else pd.NaT
 last_order_date = valid_sales_dates.max() if not valid_sales_dates.empty else pd.NaT
+net_sales_total = orders_enriched["Net_Sales"].sum(min_count=1)
+gross_sales_total = orders_enriched["Gross_Sales"].sum(min_count=1)
+discount_total = orders_enriched["Discount_Amount"].sum(min_count=1)
+cost_total = orders_enriched["Total_Cost"].sum(min_count=1)
+profit_total = orders_enriched["Gross_Profit"].sum(min_count=1)
+order_total = orders_enriched["Order_ID"].nunique()
+customer_total = orders_enriched["Customer_ID"].nunique()
+units_total = orders_enriched["Quantity"].sum(min_count=1)
+return_units_total = orders_enriched["Return_Quantity"].sum(min_count=1) if not returns.empty else 0
+refund_total = orders_enriched["Refund_Amount"].sum(min_count=1) if not returns.empty else 0
+returned_order_lines = returns.loc[returns["Return_Quantity"].fillna(0) > 0, "Order_Line_ID"].nunique()
+
+executive_summary = pd.DataFrame(
+    [
+        metric_row("First Order Date", first_order_date, "Earliest valid Order_Date in the orders data."),
+        metric_row("Last Order Date", last_order_date, "Latest valid Order_Date in the orders data."),
+        metric_row("Days Covered", (last_order_date - first_order_date).days if pd.notna(first_order_date) and pd.notna(last_order_date) else np.nan, "Calendar days between first and last valid order date."),
+        metric_row("Gross Sales", gross_sales_total, "Quantity × Unit_Price before discounts; excludes tax/shipping because not provided."),
+        metric_row("Discount Amount", discount_total, "Gross sales × Discount_Pct."),
+        metric_row("Net Sales", net_sales_total, "Sales after discounts, before refunds."),
+        metric_row("Total Cost", cost_total, "Quantity × Unit_Cost from the product master."),
+        metric_row("Gross Profit", profit_total, "Net Sales − estimated product cost; not net income."),
+        metric_row("Gross Margin %", safe_divide(profit_total, net_sales_total), "Gross Profit ÷ Net Sales."),
+        metric_row("Discount % of Gross Sales", safe_divide(discount_total, gross_sales_total), "Discount Amount ÷ Gross Sales."),
+        metric_row("Orders", order_total, "Distinct Order_ID count."),
+        metric_row("Order Lines", orders_enriched["Order_Line_ID"].nunique(), "Distinct Order_Line_ID count."),
+        metric_row("Units Sold", units_total, "Sum of known order quantities; missing quantities are excluded."),
+        metric_row("Customers With Orders", customer_total, "Distinct non-missing Customer_ID values in orders."),
+        metric_row("Average Order Value", safe_divide(net_sales_total, order_total), "Net Sales ÷ distinct orders."),
+        metric_row("Average Sales per Customer", safe_divide(net_sales_total, customer_total), "Net Sales ÷ customers with orders."),
+        metric_row("Average Units per Order", safe_divide(units_total, order_total), "Known units sold ÷ distinct orders."),
+        metric_row("Average Selling Price per Unit", safe_divide(net_sales_total, units_total), "Net Sales ÷ known units sold."),
+        metric_row("Average Line Discount %", orders_enriched["Discount_Pct"].mean(), "Arithmetic average discount percentage per order line; not weighted by sales."),
+        metric_row("Return Records", returns["Return_ID"].nunique(), "Distinct Return_ID count."),
+        metric_row("Returned Units", return_units_total, "Sum of known Return_Quantity values."),
+        metric_row("Refund Amount", refund_total, "Sum of recorded/calculated Refund_Amount values; see return quality checks."),
+        metric_row("Return Rate by Units %", safe_divide(return_units_total, units_total), "Known returned units ÷ known units sold; interpret with missing return quantities in mind."),
+        metric_row("Order Lines With a Return", returned_order_lines, "Distinct order lines with a positive known return quantity."),
+        metric_row("Return Line Rate %", safe_divide(returned_order_lines, orders_enriched["Order_Line_ID"].nunique()), "Order lines with known positive returns ÷ all order lines."),
+        metric_row("Sales After Recorded Refunds", net_sales_total - refund_total if pd.notna(net_sales_total) else np.nan, "Net Sales minus refunds; useful as a simplified indicator, not a full accounting measure."),
+    ]
+)
