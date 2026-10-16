@@ -193,7 +193,7 @@ orders_enriched["Return_Unit_Rate"] = np.where(
 
 # Common summary functions
 
-def safe_devide(numerator, denominator):
+def safe_divide(numerator, denominator):
     if pd.isna(denominator) or denominator == 0:
         return np.nan
     return numerator / denominator
@@ -305,4 +305,227 @@ executive_summary = pd.DataFrame(
         metric_row("Return Line Rate %", safe_divide(returned_order_lines, orders_enriched["Order_Line_ID"].nunique()), "Order lines with known positive returns ÷ all order lines."),
         metric_row("Sales After Recorded Refunds", net_sales_total - refund_total if pd.notna(net_sales_total) else np.nan, "Net Sales minus refunds; useful as a simplified indicator, not a full accounting measure."),
     ]
+)
+
+# Sales trends: daily, monthly, quarterly, yearly, weekday
+
+monthly_sales = trend_summary(orders_enriched, "Year_Month")
+quarterly_sales = trend_summary(orders_enriched, "Quarter")
+yearly_sales = trend_summary(orders_enriched, "Year")
+daily_sales = summarize_sales(orders_enriched.dropna(subset=["Order_Date"]), "Order_Date")
+daily_sales = daily_sales.sort_values("Order_Date").reset_index(drop=True)
+
+weekly_sales = summarize_sales(
+    orders_enriched(subset=["Day_of_Week"]), ["Weekday_Number", "Day_of_Week"]
+).sort_values("Weekday_Number")
+
+daily_by_weekday = (
+    orders_enriched.dropna(subset=["Order_Date", "Day_of_Week"])
+    .groupby(["Order_Date", "Weekday_Number", "Day_of_Week"], dropna=False)
+    .agg(Daily_Net_Sales=("Net_Sales", "sum"), Daily_Gross_Profit=("Gross_Profit", "sum"))
+    .reset_index()
+)
+average_daily_sales_by_weekday = (
+    daily_by_weekday.groupby(["Weekday_Number", "Day_of_Week"], dropna=False)
+    .agg(Trading_Day=("Order_Date", "nunique"), Average_Daily_Net_Sales=("Daily_Net_Sales", "mean"),
+         Median_Daily_Net_Sales=("Daily_Net_Sales", "median"), Average_Daily_Gross_Profit=("Daily_Gross_Profit", "mean"))
+    .reset_index().sort_values("Weekday_Number")
+)
+
+month_seasonality = summarize_sales(orders_enriched.dropna(subset=["Month_Number"]), ["Month_Number", "Month_Name"]).sort_values("Month_Number")
+
+monthly_weekday = summarize_sales(
+    orders_enriched.dropna(subset=["Year_Month", "Day_of_Week"]),
+    ["Year_Month", "Day_of_Week"],
+)
+monthly_channel_sales = summarize_sales(orders_enriched.dropna(subset=["Year_Month"]), ["Year_Month", "Sales_Channel"])
+monthly_category_sales = summarize_sales(orders_enriched.dropna(subset=["Year_Month"]), ["Year_Month", "Category"])
+monthly_store_sales = summarize_sales(orders_enriched.dropna(subset=["Year_Month"]), ["Year_Month", "Store_ID", "Store_Name", "Region"])
+
+# Dimension performance: channel, store, region, products, customers
+
+channel_performance = summarize_sales(orders_enriched, "Sales_Channel").sort_values("Net_Sales", ascending=False)
+region_performance = summarize_sales(orders_enriched, "Region").sort_values("Net_Sales", asceding=False)
+store_performance = summarize_sales(
+    orders_enriched,
+    ["Store_ID", "Store_Name", "Store_City", "Region", "Store_Type"]
+).sort_values("Net_Sales", ascending=False)
+store_type_performance = summarize_sales(orders_enriched, "Store_Type").sort_values("Net_Sales", ascending=False)
+category_performance = summarize_sales(orders_enriched, "Category").sort_values("Net_Sales", ascending=False)
+brand_performance = summarize_sales(orders_enriched, "Brand").sort_value("Net_Sales", ascending=False)
+product_performance = summarize_sales(
+    orders_enriched,
+    ["Product_ID", "Product_Name", "Category", "Brand"]
+).sort_values("Net_Sales", ascending=False)
+customer_segment_performance = summarize_sales(orders_enriched, "Customer_Segment").sort_values("Net_Sales", ascending=False)
+loyalty_tier_performance = summarize_sales(orders_enriched, "Loyalty_Tier").sort_values("Net_Sales", ascending=False)
+customer_city_performance = summarize_sales(orders_enriched, "Customer_City").sort_values("Net_Sales", ascending=False)
+
+channel_category_pivot = pd.pivot_table(
+    orders_enriched,
+    index="Sales_Channel",
+    columns="Category",
+    values="Net_Sales",
+    aggfunc="sum",
+    fill_value=0,
+    dropna=False,
+).reset_index()
+region_category_pivot = pd.pivot_table(
+    orders_enriched,
+    index="Region",
+    columns="Category",
+    values="Net_Sales",
+    aggfunc="sum",
+    fill_value=0,
+    dropna=False,
+).reset_index()
+segment_channel_pivot = pd.pivot_table(
+    orders_enriched,
+    index="Customer_Segment",
+    columns="Sales_Channel",
+    values="Net_Sales",
+    aggfunc="sum",
+    fill_value=0,
+    dropna=False
+).reset_index()
+
+# Discount and profitability analysis
+
+def discount_band(value):
+    if pd.isna(value):
+        return "Unknown"
+    if value == 0:
+        return "No Discount"
+    if value <= 0.10:
+        return ">0-10%"
+    if value <= 0.20:
+        return ">10-20%"
+    if value <= 0.30:
+        return ">20-30%"
+    return ">30%"
+
+orders_enriched["Discount_Band"] = orders_enriched["Discount_Pct"].apply(discount_band)
+discount_order = ["No Discount", ">0-10%", ">10-20%", ">20-30%", ">30%", "Unknown"]
+discount_analysis = summarize_sales(orders_enriched, "Discount_Band")
+discount_analysis["Discount_Band"] = pd.Categorical(
+    discount_analysis["Discount_Band"], categories=discount_order, ordered=True
+)
+discount_analysis = discount_analysis.sort_values("Discount_Band").reset_index(drop=True)
+
+discount_line_stats = (
+    orders_enriched.groupby("Discount_Band", dropna=False)
+    .agg(
+        Order_Line_Count=("Order_Line_ID", "nunique"),
+        Quantity_Median=("Quantity", "median"),
+        Net_Sales_Median=("Net_Sales", "median"),
+        Gross_Profit_Median=("Gross_Profit", "median"),
+        Gross_Margin_Median=("Gross_Margin_Pct", "median"),
+        Discount_Pct_Mean=("Discount_Pct", "mean"),
+    ).reset_index()
+)
+
+# Customer behavior: RFM, repeat buying and signup cohorts
+
+order_level = (
+    orders_enriched.groupby("Order_ID", dropna=False)
+    .agg(
+        Order_Date=("Order_Date", "min"),
+        Customer_ID=("Customer_ID", "first"),
+        Sales_Channel=("Sales_Channel", "first"),
+        Store_ID=("Store_ID", "first"),
+        Order_Net_Sales=("Net_Sales", "sum"),
+        Order_Gross_Profit=("Gross_Profit", "sum"),
+        Order_Gross_Sales=("Gross_Sales", "sum"),
+        Order_Discount_Amount=("Discount_Amount", "sum"),
+        Order_Units=("Quantity", "sum"),
+        Order_Line_Count=("Order_Line_ID", "nunique"),
+        Distinct_Products=("Product_ID", "nunique"),
+    ).reset_index()
+)
+order_level["Year_Month"] = order_level["Order_Date"].dt.to_period("M").astype("string")
+order_level["Average_Line_Value"] = np.where(
+    order_level["Order_Line_Count"] > 0,
+    order_level["Order_Net_Sales"] / order_level["Order_Line_Count"],
+    np.nan,
+)
+
+snapshot_date = last_order_date
+customer_orders = order_level.dropna(subset=["Customer_ID"]).copy()
+if pd.notna(snapshot_date):
+    rfm = (
+        customer_orders.groupby("Customer_ID")
+        .agg(
+            Last_Order_Date=("Order_Date", "max"),
+            Frequency_Orders=("Order_ID", "nunique"),
+            Monetary_Net_Sales=("Order_Net_Sales", "sum"),
+        ).reset_index()
+    )
+    rfm["Recency_Days"] = (snapshot_date - rfm["Last_Order_Date"]).dt.days
+else:
+    rfm = pd.DataFrame(columns=["Customer", "Last_Order_Date", "Frequency_Orders", "Monetary_Net_Sales", "Recency_Days"])
+
+rfm["Frequency_Orders"] = rfm["Frequency_Orders"].fillna(0)
+rfm["Monetary_Net_Sales"] = rfm["Monetary_Net_Sales"].fillna(0)
+
+active_rfm = rfm[rfm["Frequency_Orders"] > 0].copy()
+if not active_rfm.empty:
+    active_rfm["R_Score"] = (6 - np.ceil(active_rfm["Recency_Days"].rank(method="average", pct=True) * 5)).clip(1, 5)
+    active_rfm["F_Score"] = np.ceil(active_rfm["Frequency_Orders"].rank(method="average", pct=True) * 5).clip(1, 5)
+    active_rfm["M_Score"] = np.ceil(active_rfm["Monetary_Net_Sales"].rank(method="average", pct=True) * 5).clip(1, 5)
+    for score_column in ["R_Score", "F_Score", "M_Score"]:
+        active_rfm[score_column] = active_rfm[score_column].astype("Int64")
+    active_rfm["RFM_Score"] = (
+        active_rfm["R_Score"].astype(str)
+        + active_rfm["F_Score"].astype(str)
+        + active_rfm["M_Score"].astype(str)
+    )
+    active_rfm["RFM_Total"] = active_rfm[["R_Score", "F_Score", "M_Score"]].sum(axis=1)
+    active_rfm["Customer_Group"] = np.select(
+        [
+            (active_rfm["R_Score"] >= 4) & (active_rfm["F_Score"] >= 4) & (active_rfm["M_Score"] >= 4),
+            (active_rfm["R_Score"] >= 3) & (active_rfm["F_Score"] >= 3),
+            (active_rfm["R_Score"] <= 2) & (active_rfm["F_Score"] >= 3),
+            (active_rfm["R_Score"] <= 2) & (active_rfm["F_Score"] <= 2),
+        ],
+        ["High Value / Active", "Loyal / Regular", "At Risk / Previously Frequent", "Inactive / Low Frequency"],
+        default="Needs Review",
+    )
+else:
+    active_rfm["R_Score"] = pd.Series(dtype="Int64")
+    active_rfm["F_Score"] = pd.Series(dtype="Int64")
+    active_rfm["M_Score"] = pd.Series(dtype="Int64")
+    active_rfm["RFM_Score"] = pd.Series(dtype="string")
+    active_rfm["RFM_Total"] = pd.Series(dtype="float")
+    active_rfm["Customer_Group"] = pd.Series(dtype="string")
+
+rfm = rfm.merge(
+    active_rfm[["Customer_ID", "R_Score", "F_Score", "M_Score", "RFM_Score", "RFM_Total", "Customer_Group"]],
+    on="Customer_ID", how="left", validate="one_to_one",
+)
+rfm["Customer_Group"] = rfm["Customer_Group"].fillna("No Recorded Orders")
+
+customer_purchase_summary = (
+    customer_orders.groupby("Customer_ID")
+    .agg(
+        Order_Count=("Order_ID", "nunique"),
+        Net_Sales=("Order_Net_Sales", "sum"),
+        Gross_Profit=("Order_Gross_Profit", "sum"),
+        First_Order_Date=("Order_Date", "min"),
+        Last_Order_Date=("Order_Date", "max"),
+    ).reset_index()
+)
+customer_purchase_summary["Repeat_Customer_Flag"] = customer_purchase_summary["Order_Count"] >= 2
+customer_purchase_summary["Customer_Type"] = np.where(
+    customer_purchase_summary["Repeat_Customer_Flag"], "Repeat Customer", "One-Time Customer"
+)
+repeat_purchase_summary = (
+    customer_purchase_summary.groupby("Customer_Type")
+    .agg(
+        Customer_Count=("Customer_ID", "nunique"),
+        Orders=("Order_Count", "sum"),
+        Net_Sale=("Net_Sales", "sum"),
+        Gross_Profit=("Gross_Profit", "sum"),
+        Average_Orders_Per_Customer=("Order_Count", "mean"),
+        Average_Sales_Per_Customer=("Net_Sales", "mean"),
+    ).reset_index()
 )
