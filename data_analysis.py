@@ -529,3 +529,204 @@ repeat_purchase_summary = (
         Average_Sales_Per_Customer=("Net_Sales", "mean"),
     ).reset_index()
 )
+
+cohort_orders = orders_enriched.dropna(subset=["Signup_Month"]).copy()
+cohort_performance = summarize_sales(cohort_orders, "Signup_Month")
+cohort_sizes = (
+    customers.dropna(subset=["Signup_Date"])
+    .assign(Signup_Month=lambda frame: frame["Signup_Date"].dt.to_period("M").astype("string"))
+    .groupby("Signup_Month")
+    .agg(Registered_Customer_Count=("Customer_ID", "nunique"))
+    .reset_index()
+)
+cohort_performance = cohort_sizes.merge(cohort_performance, on="Signup_Month", how="left")
+cohort_performance["Sales_Per_Registered_Customer"] = np.where(
+    cohort_performance["Registered_Customer_Count"] > 0,
+    cohort_performance["Net_Sales"] / cohort_performance["Registered_Customer_Count"],
+    np.nan,
+)
+
+retention_source = orders_enriched.dropna(subset=["Customer_ID", "Signup_Date", "Order_Date"]).copy()
+retention_source["Cohort_Month"] = retention_source["Signup_Date"].dt.to_period("M").astype("string")
+retention_source["Order_Month"] = retention_source["Order_Date"].dt.to_period("M").astype("string")
+retention_source["Months_Since_Signup"] = (
+    (retention_source["Order_Date"].dt.year - retention_source["Signup_Date"].dt.year) * 12
+    + retention_source["Order_Date"].dt.month - retention_source["Signup_Date"].dt.month
+)
+retention_source = retention_source[
+    (retention_source["Months_Since_Signup"] >= 0)
+    & (retention_source["Order_Date"] >= retention_source["Signup_Date"])
+]
+customer_cohort_sizes = (
+    customers.dropna(subset=["Signup_Date"])
+    .assign(Cohort_Month=lambda frame: frame["Signup_Date"].dt.to_period("M").astype("string"))
+    .groupby("Cohort_Month").agg(Cohort_Size=("Customer_ID", "nunique")).reset_index()
+)
+customer_retention_cohort = (
+    retention_source.groupby(["Cohort_Month", "Order_Month", "Month_Since_Signup"], dropna=False)
+    .agg(Active_Customers=("Customer_ID", "nunique"), Orders=("Order_ID", "nunique"), Net_Sales=("Net_Sales", "sum"))
+    .reset_index()
+    .merge(customer_cohort_sizes, on="Cohort_Month", how="left")
+)
+customer_retention_cohort["Customer_Retention_Pct"] = np.where(
+    customer_retention_cohort["Cohort_Size"] > 0,
+    customer_retention_cohort["Active_Customers"] / customer_retention_cohort["Cohort_Size"],
+    np.nan,
+)
+if not customer_retention_cohort.empty:
+    customer_retention_pivot = customer_retention_cohort.pivot_table(
+        index="Cohort_Month", columns="Month_Since_Signup", values="Customer_Retention_Pct", aggfunc="mean"
+    ).reset_index()
+else:
+    customer_retention_pivot = pd.DataFrame(columns=["Cohort_Month"])
+
+# Order / Basket analysis and product pair affinity
+
+basket_summary = pd.DataFrame(
+    [
+        metric_row("Average distinct products per order", order_level["Distinct_Products"].mean(), "Average count of distinct Product_IDs in an order."),
+        metric_row("Median distinct products per order", order_level["Distinct_Products"].median(), "Median count of distinct Product_IDs in an order."),
+        metric_row("Average order lines", order_level["Order_Line_Count"].mean(), "Average count of order lines per Order_ID."),
+        metric_row("Average order units", order_level["Order_Units"].mean(), "Average sum of known quantity by order."),
+        metric_row("Median order value", order_level["Order_Net_Sales"].median(), "Median net sales per order."),
+        metric_row("90th percentile order value", order_level["Order_Net_Sales"].quantile(0.90), "90th percentile net sales per order."),
+    ]
+)
+
+product_name_lookup = product_dim.set_index("Product_ID")["Product_Name"].to_dict()
+product_orders = {}
+pair_counts = {}
+number_of_orders_for_affinity = orders_enriched["Order_ID"].nunique()
+for order_id, group in orders_enriched.dropna(subset=["Product_ID"]).groupby("Order_ID"):
+    product_ids = sorted(set(group["Product_ID"].astype(str)))
+    for product_id in product_ids:
+        product_orders[product_id] = product_orders.get(product_id, 0) + 1
+    for product_a, product_b in combinations(product_ids, 2):
+        pair_counts[(product_a, product_b)] = pair_counts.get((product_a, product_b), 0) + 1
+
+pair_rows = []
+for (product_a, product_b), pair_order_count in pair_counts.items():
+    count_a = product_orders.get(product_a, 0)
+    count_b = product_orders.get(product_b, 0)
+    expected_if_independent = (count_a * count_b / number_of_orders_for_affinity) if number_of_orders_for_affinity else np.nan
+    lift = (pair_order_count / expected_if_independent) if expected_if_independent and expected_if_independent > 0 else np.nan
+    pair_rows.append(
+        {
+            "Product_A_ID": product_a,
+            "Product_A_Name": product_name_lookup.get(product_a, "Unknown Product"),
+            "Product_B_ID": product_b,
+            "Product_B_Name": product_name_lookup.get(product_b, "Unknown Product"),
+            "Orders_Containing_Both": pair_order_count,
+            "Support_Pct": safe_divide(pair_order_count, number_of_orders_for_affinity),
+            "Orders_With_Product_A": count_a,
+            "Orders_With_Product_B": count_b,
+            "Lift": lift,
+        }
+    )
+product_pair_affinity = pd.DataFrame(pair_rows)
+if not product_pair_affinity.empty:
+    product_pair_affinity = product_pair_affinity.sort_values(
+        ["Orders_Containing_Both", "Lift"], ascending=[False, False]
+    ).head(TOP_PRODUCT_PAIRS)
+
+# Product revenue concentration (ABC / PARETO)
+
+product_abc = product_performance.dropna(subset=["Product_ID"]).copy().sort_values("Net_Sales", ascending=False).reset_index(drop=True)
+product_abc["ABC_Class"] = np.select(
+    [product_abc["Cumulative_Revenue_Share"] <= 0.80, product_abc["Cumulative_Revenue_Share"] <= 0.95],
+    ["A", "B"],
+    default="C",
+)
+
+# Returns: reasons, product, channel and store
+
+if returns.empty:
+    return_enriched = returns.copy()
+else:
+    order_return_details = orders_enriched[
+        [
+            "Order_Line_ID", "Order_ID", "Order_Date", "Customer_ID", "Customer_Segment",
+            "Loyalty_Tier", "Product_ID", "Product_Name", "Category", "Brand",
+            "Store_ID", "Store_Name", "Region", "Sales_Channel", "Quantity", "Unit_Price", "Discount_Pct", "Net_Sales",
+        ]
+    ].drop_duplicates("Order_Line_ID")
+    return_enriched = returns.merge(
+        order_return_details,
+        on="Order_Line_ID",
+        how="left",
+        validate="many_to_one",
+    )
+    return_enriched["Days_From_Order_To_Return"] = (
+        return_enriched["Return_Date"] - return_enriched["Order_Date"]
+    ).dt.days
+
+return_records = returns["Return_ID"].nunique()
+return_summary = pd.DataFrame(
+    [
+        metric_row("Return Records", return_records, "Distinct Return_IDs."),
+        metric_row("Returned Order Lines", returns.loc[returns["Return_Quantity"].fillna(0) > 0, "Order_Line_ID"].nunique(), "Order lines with a positive known return quantity."),
+        metric_row("Returned Units", returns["Return_Quantity"].sum(min_count=1) if not returns.empty else 0, "Sum of known returned quantities."),
+        metric_row("Refund Amount", returns["Refund_Amount"].sum(min_count=1) if not returns.empty else 0, "Sum of known refunds. Includes inferred values already filled during cleaning, where applicable."),
+        metric_row("Average Refund per Return", safe_divide(returns["Refund_Amount"].sum(min_count=1), return_records) if not returns.empty else np.nan, "Known refund amount divided by return records."),
+        metric_row("Median Days to Return", return_enriched["Days_From_Order_To_Return"].median() if "Days_From_Order_To_Return" in return_enriched.columns else np.nan, "Median return date minus original order date for matched return records."),
+    ]
+)
+
+if not returns.empty:
+    return_reasons = (
+        return_enriched.groupby("Return_Reasons", dropna=False)
+        .agg(
+            Return_Records=("Return_ID", "nunique"),
+            Returned_Units=("Return_Quantity", "sum"),
+            Refund_Amount=("Refund_Amount", "sum"),
+            Average_Days_To_Return=("Days_From_Order_To_Return", "mean"),
+        )
+        .reset_index()
+        .sort_values("Return_Records", ascending=False)
+    )
+    returned_products = (
+        return_enriched.groupby(["Product_ID", "Product_Name", "Category", "Brand"], dropna=False)
+        .agg(
+            Return_Records=("Return_ID", "nunique"),
+            Returned_Units=("Return_Quantity", "sum"),
+            Refund_Amount=("Refund_Amount", "sum"),
+        )
+        .reset_index()
+        .sort_values("Return_Records", ascending=False)
+    )
+    returns_by_channel = (
+        return_enriched.groupby("Sales_Channel", dropna=False)
+        .agg(
+            Return_Records=("Return_ID", "nunique"),
+            Returned_Units=("Return_Quantity", "sum"),
+            Refund_Amount=("Refund_Amount", "sum"),
+        )
+        .reset_index()
+    )
+    returns_by_store = (
+        return_enriched.groupby(["Store_ID", "Store_Name", "Region"], dropna=False)
+        .agg(
+            Return_Records=("Return_ID", "nunique"),
+            Returned_Units=("Return_Quantity", "sum"),
+            Refund_Amount=("Refund_Amount", "sum"),
+        )
+        .reset_index()
+    )
+else:
+    return_reasons = pd.DataFrame(columns=["Return_Reason", "Return_Records", "Returned_Units", "Refund_Amount", "Average_Days_To_Return"])
+    returned_products = pd.DataFrame(columns=["Product_ID", "Product_Name", "Category", "Brand", "Return_Records", "Returned_Units", "Refund_Amount"])
+    returns_by_channel = pd.DataFrame(columns=["Sales_Channel", "Return_Records", "Returned_Units", "Refund_Amount"])
+    returns_by_store = pd.DataFrame(columns=["Store_ID", "Store_Name", "Region", "Return_Records", "Returned_Units", "Refund_Amount"])
+
+product_return_rates = product_performance.merge(
+    returned_products[["Product_ID", "Return_Records", "Returned_Units", "Refund_Amount"]],
+    on="Product_ID", how="left", validate="one_to_one", suffixes=("", "_Return")
+)
+for column in ["Return_Records", "Returned_Units", "Refund_Amount"]:
+    product_return_rates[column] = product_return_rates[column].fillna(0)
+product_return_rates["Returned_Units_Rate"] = np.where(
+    product_return_rates["Units_Sold"] > 0, product_return_rates["Returned_Units"] / product_return_rates["Units_Sold"], np.nan
+)
+product_return_rates["Return_Record_Rate_Per_Order_Line"] = np.where(
+    product_return_rates["Order_Line_Count"] > 0, product_return_rates["Return_Records"] / product_return_rates["Order_Line_Count"], np.nan
+)
